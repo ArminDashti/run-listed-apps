@@ -1,0 +1,13 @@
+# Copy entries into apps.yaml and set enabled: true for each pair you want to start.
+
+root: C:/Users/armin/GitHub
+
+apps:
+  - name: helix
+    enabled: false
+    api: helix-api
+    webui: helix-webui
+  - name: lexmora
+    enabled: false
+    api: lexmora-api
+    webui: lexmora-webui

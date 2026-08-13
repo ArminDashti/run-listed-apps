@@ -1,0 +1,13 @@
+# Only apps listed below with enabled: true are started.
+# Run-ListedApps.ps1 never scans the GitHub folder for projects.
+# api / webui paths are relative to root unless they are absolute.
+
+root: C:/Users/armin/GitHub
+
+apps: []
+
+# Example — copy into apps, then set enabled: true:
+# - name: helix
+#   enabled: false
+#   api: helix-api
+#   webui: helix-webui

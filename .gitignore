@@ -1,0 +1,5 @@
+logs/
+.run-listed-apps-state.json
+*.log
+Thumbs.db
+.DS_Store
