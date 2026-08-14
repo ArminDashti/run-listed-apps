@@ -51,6 +51,18 @@ Stop processes this script last started:
 .\Run-ListedApps.ps1 -Stop
 ```
 
+After a successful start, open the links page:
+
+```text
+http://127.0.0.1:5050/
+```
+
+That page lists every app’s WebUI and API URLs (with up/down status) and refreshes every 5 seconds. Start only the page against an existing state file:
+
+```powershell
+.\Run-ListedApps.ps1 -DashboardOnly
+```
+
 ## apps.yaml
 
 ```yaml
@@ -83,6 +95,7 @@ For each enabled app:
 4. Picks a **free** port: API `8000–8999`, WebUI `5173–5299`. Never binds `1–1023`. Never kills other processes to free a port.
 5. Starts API, then WebUI, with hot reload when the tool is available (`air`, `cargo-watch`, Django/Vite reload, `uvicorn --reload`).
 6. Prints URLs, ports, PIDs, and log paths.
+7. Opens a links dashboard at `http://127.0.0.1:5050/` with clickable links to every started app.
 
 Process logs go to `logs/`. Last-run PIDs are stored in `.run-listed-apps-state.json` (both gitignored).
 

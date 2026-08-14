@@ -1,5 +1,9 @@
+*.exe
 logs/
 .run-listed-apps-state.json
 *.log
 Thumbs.db
 .DS_Store
+
+# BEGIN AUTO-MANAGED LARGE FILES (>5MB)
+# END AUTO-MANAGED LARGE FILES

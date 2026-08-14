@@ -11,7 +11,11 @@
 param(
     [string]$Config = "",
     [switch]$List,
-    [switch]$Stop
+    [switch]$Stop,
+    [switch]$ApiOnly,
+    [switch]$WebUiOnly,
+    [switch]$DashboardOnly,
+    [int]$DashboardPort = 5050
 )
 
 Set-StrictMode -Version Latest
@@ -25,7 +29,7 @@ $StatePath = Join-Path $ScriptDir ".run-listed-apps-state.json"
 $LogDir = Join-Path $ScriptDir "logs"
 $UsedPorts = New-Object "System.Collections.Generic.HashSet[int]"
 
-$ApiPortMin = 8000
+$ApiPortMin = 8171
 $ApiPortMax = 8999
 $UiPortMin = 5173
 $UiPortMax = 5299
@@ -81,6 +85,7 @@ function Read-AppsYaml {
                 enabled = $false
                 api     = $null
                 webui   = $null
+                listen  = $true
             }
             continue
         }
@@ -100,6 +105,11 @@ function Read-AppsYaml {
         }
         if ($line -match '^\s+webui:\s*(.+)$') {
             $current.webui = $Matches[1].Trim().Trim('"').Trim("'")
+            continue
+        }
+        if ($line -match '^\s+listen:\s*(.+)$') {
+            $val = $Matches[1].Trim().ToLowerInvariant()
+            $current.listen = $val -notin @("false", "no", "0")
             continue
         }
     }
@@ -147,21 +157,36 @@ function Test-PortInUse {
     return $null -ne $hits
 }
 
+function Test-PortBindable {
+    param([int]$Port)
+    if ($UsedPorts.Contains($Port)) {
+        return $false
+    }
+    if (Test-PortInUse -Port $Port) {
+        return $false
+    }
+    try {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+        $listener.Start()
+        $listener.Stop()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Find-FreePort {
     param(
         [int]$Min,
         [int]$Max
     )
     for ($p = $Min; $p -le $Max; $p++) {
-        if ($UsedPorts.Contains($p)) {
-            continue
-        }
-        if (-not (Test-PortInUse -Port $p)) {
+        if (Test-PortBindable -Port $p) {
             [void]$UsedPorts.Add($p)
             return $p
         }
     }
-    throw "No free port in range $Min-$Max"
+    throw "No bindable port in range $Min-$Max (listening or OS-excluded)"
 }
 
 function Get-CommandPath {
@@ -258,6 +283,21 @@ function Test-LooksLikeFastApi {
     return $false
 }
 
+function Resolve-ApiWorkingDir {
+    param([string]$Dir)
+    if (-not $Dir -or -not (Test-Path -LiteralPath $Dir)) {
+        return $Dir
+    }
+    if (Test-Path -LiteralPath (Join-Path $Dir "manage.py")) {
+        return $Dir
+    }
+    $backend = Join-Path $Dir "backend"
+    if (Test-Path -LiteralPath (Join-Path $backend "manage.py")) {
+        return $backend
+    }
+    return $Dir
+}
+
 function Get-ApiStack {
     param([string]$Dir)
     if (-not $Dir -or -not (Test-Path -LiteralPath $Dir)) {
@@ -269,6 +309,10 @@ function Get-ApiStack {
     if (Test-LooksLikeFastApi -Dir $Dir) { return "fastapi" }
     if ((Test-Path -LiteralPath (Join-Path $Dir "pyproject.toml")) -or (Test-Path -LiteralPath (Join-Path $Dir "requirements.txt"))) {
         return "python"
+    }
+    $pkgPath = Join-Path $Dir "package.json"
+    if (Test-Path -LiteralPath $pkgPath) {
+        return "node"
     }
     return $null
 }
@@ -409,11 +453,14 @@ function Start-ApiProcess {
     Ensure-EnvFile -Dir $Dir
     $log = Join-Path $LogDir "$Name-api.log"
     $origin = "http://127.0.0.1:$UiPort"
+    $bind = "127.0.0.1:$Port"
     $envMap = @{
         PORT              = "$Port"
         API_PORT          = "$Port"
         CORS_ORIGIN       = $origin
         ALLOWED_ORIGINS   = $origin
+        JANUS_API_BIND    = $bind
+        NETVAN_API_BIND   = $bind
     }
 
     switch ($Stack) {
@@ -450,13 +497,25 @@ function Start-ApiProcess {
                 Write-ErrLine "Rust/cargo is not installed; skip API for $Name"
                 return $null
             }
-            $watch = Get-CommandPath "cargo-watch"
-            if ($watch) {
-                Write-Info "  hot reload: cargo watch"
-                return Start-LoggedProcess -FilePath $cargo -ArgumentList @("watch", "-x", "run") -WorkingDirectory $Dir -LogPath $log -Environment $envMap
+            $runArgs = @("run")
+            $leaf = Split-Path $Dir -Leaf
+            if ($leaf -like "*roust*") {
+                $runArgs = @("run", "--bin", "roust-api", "--", "--bind", "127.0.0.1:$Port")
             }
-            Write-Info "  hot reload: off (cargo-watch not installed); cargo run"
-            return Start-LoggedProcess -FilePath $cargo -ArgumentList @("run") -WorkingDirectory $Dir -LogPath $log -Environment $envMap
+            Write-Info "  hot reload: off (cargo run); cargo-watch is blocked on this machine"
+            return Start-LoggedProcess -FilePath $cargo -ArgumentList $runArgs -WorkingDirectory $Dir -LogPath $log -Environment $envMap
+        }
+        "node" {
+            if (-not (Install-NodePackages -Dir $Dir)) {
+                return $null
+            }
+            $pm = Get-PackageManager -Dir $Dir
+            if (-not $pm) {
+                Write-ErrLine "npm/pnpm/yarn not found; skip API for $Name"
+                return $null
+            }
+            Write-Info "  hot reload: $($pm.Name) run dev"
+            return Start-LoggedProcess -FilePath $pm.Exe -ArgumentList @("run", "dev") -WorkingDirectory $Dir -LogPath $log -Environment $envMap
         }
         "django" {
             $py = Get-PythonExe -Dir $Dir
@@ -529,7 +588,62 @@ function Start-WebUiProcess {
     return Start-LoggedProcess -FilePath $pm.Exe -ArgumentList $args -WorkingDirectory $Dir -LogPath $log -Environment $envMap
 }
 
+function Stop-DashboardOnPort {
+    param([int]$Port)
+    try {
+        $conns = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
+        foreach ($c in $conns) {
+            if ($c.OwningProcess -and $c.OwningProcess -gt 4) {
+                Stop-Process -Id ([int]$c.OwningProcess) -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch { }
+    # Kill leftover dashboard powershell by command line if still holding HTTP.sys reservation
+    try {
+        Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and $_.CommandLine -like '*Start-LinksDashboard.ps1*' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch { }
+}
+
+function Start-LinksDashboard {
+    param([int]$Port = 5050)
+    Stop-DashboardOnPort -Port $Port
+    if (-not (Test-PortBindable -Port $Port)) {
+        Write-WarnLine "Dashboard port $Port is not bindable."
+        return $null
+    }
+    $dashScript = Join-Path $ScriptDir "Start-LinksDashboard.ps1"
+    if (-not (Test-Path -LiteralPath $dashScript)) {
+        Write-ErrLine "Missing $dashScript"
+        return $null
+    }
+    $log = Join-Path $LogDir "links-dashboard.log"
+    if (-not (Test-Path -LiteralPath $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir | Out-Null
+    }
+    $errPath = "$log.err"
+    $args = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", $dashScript,
+        "-StatePath", $StatePath,
+        "-Port", "$Port"
+    )
+    $proc = Start-Process -FilePath "powershell.exe" -ArgumentList $args -WorkingDirectory $ScriptDir -PassThru -WindowStyle Hidden -RedirectStandardOutput $log -RedirectStandardError $errPath
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 250
+        if (Test-PortInUse -Port $Port) {
+            Write-Info "Links page: http://127.0.0.1:$Port/  PID $($proc.Id)"
+            return $proc
+        }
+    }
+    Write-WarnLine "Dashboard did not listen on $Port. See logs/links-dashboard.log"
+    return $proc
+}
+
 function Stop-LastRun {
+    Stop-DashboardOnPort -Port $DashboardPort
     if (-not (Test-Path -LiteralPath $StatePath)) {
         Write-WarnLine "No state file; nothing to stop."
         return
@@ -577,6 +691,39 @@ if ($Stop) {
     exit 0
 }
 
+if ($DashboardOnly) {
+    if (-not (Test-Path -LiteralPath $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir | Out-Null
+    }
+    $dash = Start-LinksDashboard -Port $DashboardPort
+    if ($dash) {
+        $stateObj = $null
+        if (Test-Path -LiteralPath $StatePath) {
+            try { $stateObj = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json } catch { }
+        }
+        $procs = New-Object System.Collections.Generic.List[object]
+        if ($stateObj -and $stateObj.processes) {
+            foreach ($p in @($stateObj.processes)) {
+                if ($p.role -ne "dashboard") { [void]$procs.Add($p) }
+            }
+        }
+        [void]$procs.Add([pscustomobject]@{
+            name = "links"
+            role = "dashboard"
+            pid  = $dash.Id
+            port = $DashboardPort
+            url  = "http://127.0.0.1:$DashboardPort/"
+            wait = $true
+        })
+        $out = [pscustomobject]@{
+            startedAt = if ($stateObj -and $stateObj.startedAt) { $stateObj.startedAt } else { (Get-Date).ToString("s") }
+            processes = $procs
+        }
+        $out | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+    }
+    exit 0
+}
+
 $configObj = Read-AppsYaml -Path $Config
 if ($List) {
     Show-List -ConfigObj $configObj
@@ -601,6 +748,10 @@ foreach ($app in $enabled) {
     Write-Info "=== $($app.name) ==="
     $apiDir = Resolve-AppPath -Root $configObj.Root -Value $app.api
     $uiDir = Resolve-AppPath -Root $configObj.Root -Value $app.webui
+    $shouldListen = $true
+    if ($null -ne $app.listen) {
+        $shouldListen = [bool]$app.listen
+    }
 
     if ($app.api -and -not (Test-Path -LiteralPath $apiDir)) {
         Write-ErrLine "API path missing: $apiDir"
@@ -615,6 +766,10 @@ foreach ($app in $enabled) {
         continue
     }
 
+    if ($apiDir) {
+        $apiDir = Resolve-ApiWorkingDir -Dir $apiDir
+    }
+
     $apiStack = Get-ApiStack -Dir $apiDir
     $uiStack = Get-WebUiStack -Dir $uiDir
     $apiPort = $null
@@ -622,52 +777,93 @@ foreach ($app in $enabled) {
     $apiProc = $null
     $uiProc = $null
 
-    if ($apiDir -and $apiStack) {
+    if ($WebUiOnly) {
+        $apiStack = $null
+        $apiPort = $null
+    }
+
+    if ($apiDir -and $apiStack -and -not $WebUiOnly) {
         $apiPort = Find-FreePort -Min $ApiPortMin -Max $ApiPortMax
     }
-    if ($uiDir -and $uiStack) {
+    if ($uiDir -and $uiStack -and -not $ApiOnly) {
         $uiPort = Find-FreePort -Min $UiPortMin -Max $UiPortMax
     }
     if (-not $uiPort) { $uiPort = 5173 }
 
-    if ($apiDir -and $apiStack) {
+    if ($apiDir -and $apiStack -and -not $WebUiOnly) {
         Write-Info "API stack: $apiStack  port: $apiPort"
         $apiProc = Start-ApiProcess -Name $app.name -Dir $apiDir -Stack $apiStack -Port $apiPort -UiPort $uiPort
         if ($apiProc) {
-            $ok = Wait-PortListen -Port $apiPort
-            if ($ok) {
-                Write-Info "API listening http://127.0.0.1:$apiPort  PID $($apiProc.Id)"
-            } else {
-                Write-WarnLine "API did not listen on $apiPort within timeout. See logs/$($app.name)-api.log"
-            }
-            [void]$started.Add([pscustomobject]@{ name = $app.name; role = "api"; pid = $apiProc.Id; port = $apiPort; url = "http://127.0.0.1:$apiPort" })
+            Write-Info "API started PID $($apiProc.Id) (waiting for listen at end)"
+            [void]$started.Add([pscustomobject]@{
+                name = $app.name
+                role = "api"
+                pid  = $apiProc.Id
+                port = $apiPort
+                url  = "http://127.0.0.1:$apiPort"
+                wait = $shouldListen
+            })
         }
-    } elseif ($apiDir) {
+    } elseif ($apiDir -and -not $WebUiOnly) {
         Write-WarnLine "Could not detect API stack in $apiDir"
     }
 
-    if ($uiDir -and $uiStack) {
+    if ($uiDir -and $uiStack -and -not $ApiOnly) {
         $bindApi = 8000
         if ($apiPort) { $bindApi = $apiPort }
         Write-Info "WebUI stack: $uiStack  port: $uiPort"
         $uiProc = Start-WebUiProcess -Name $app.name -Dir $uiDir -Port $uiPort -ApiPort $bindApi
         if ($uiProc) {
-            $ok = Wait-PortListen -Port $uiPort
-            if ($ok) {
-                Write-Info "WebUI listening http://127.0.0.1:$uiPort  PID $($uiProc.Id)"
-            } else {
-                Write-WarnLine "WebUI did not listen on $uiPort within timeout. See logs/$($app.name)-webui.log"
-            }
-            [void]$started.Add([pscustomobject]@{ name = $app.name; role = "webui"; pid = $uiProc.Id; port = $uiPort; url = "http://127.0.0.1:$uiPort" })
+            Write-Info "WebUI started PID $($uiProc.Id) (waiting for listen at end)"
+            [void]$started.Add([pscustomobject]@{
+                name = $app.name
+                role = "webui"
+                pid  = $uiProc.Id
+                port = $uiPort
+                url  = "http://127.0.0.1:$uiPort"
+                wait = $true
+            })
         }
-    } elseif ($uiDir) {
+    } elseif ($uiDir -and -not $ApiOnly) {
         Write-WarnLine "Could not detect WebUI stack in $uiDir"
     }
 }
 
+Write-Host ""
+Write-Info "Waiting up to 90s for HTTP ports..."
+$deadline = (Get-Date).AddSeconds(90)
+do {
+    $pending = @($started | Where-Object { $_.wait -and -not (Test-PortInUse -Port ([int]$_.port)) })
+    if ($pending.Count -eq 0) {
+        break
+    }
+    Start-Sleep -Seconds 2
+} while ((Get-Date) -lt $deadline)
+
+$merged = @{}
+if (($ApiOnly -or $WebUiOnly) -and (Test-Path -LiteralPath $StatePath)) {
+    try {
+        $prev = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+        foreach ($p in @($prev.processes)) {
+            if (-not $p.name -or -not $p.role) { continue }
+            if ($p.role -eq "dashboard") { continue }
+            $merged["{0}|{1}" -f $p.name, $p.role] = $p
+        }
+    } catch {
+        # ignore corrupt state
+    }
+}
+foreach ($row in $started) {
+    $merged["{0}|{1}" -f $row.name, $row.role] = $row
+}
+$allProcs = New-Object System.Collections.Generic.List[object]
+foreach ($key in ($merged.Keys | Sort-Object)) {
+    [void]$allProcs.Add($merged[$key])
+}
+
 $state = [pscustomobject]@{
     startedAt  = (Get-Date).ToString("s")
-    processes  = $started
+    processes  = $allProcs
 }
 $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatePath -Encoding UTF8
 
@@ -677,7 +873,34 @@ if ($started.Count -eq 0) {
     Write-WarnLine "No processes started."
 } else {
     foreach ($row in $started) {
-        Write-Info ("  {0,-16} {1,-6} {2,-28} PID {3}" -f $row.name, $row.role, $row.url, $row.pid)
+        $status = "started"
+        if ($row.wait) {
+            if (Test-PortInUse -Port ([int]$row.port)) {
+                $status = "listening"
+            } else {
+                $status = "not-listening"
+            }
+        } else {
+            $status = "no-http-wait"
+        }
+        Write-Info ("  {0,-22} {1,-6} {2,-28} PID {3,-6} {4}" -f $row.name, $row.role, $row.url, $row.pid, $status)
     }
-    Write-Info "Stop: .\Run-ListedApps.ps1 -Stop"
 }
+
+$dash = Start-LinksDashboard -Port $DashboardPort
+if ($dash) {
+    [void]$allProcs.Add([pscustomobject]@{
+        name = "links"
+        role = "dashboard"
+        pid  = $dash.Id
+        port = $DashboardPort
+        url  = "http://127.0.0.1:$DashboardPort/"
+        wait = $true
+    })
+    $state = [pscustomobject]@{
+        startedAt  = (Get-Date).ToString("s")
+        processes  = $allProcs
+    }
+    $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+}
+Write-Info "Stop: .\Run-ListedApps.ps1 -Stop"

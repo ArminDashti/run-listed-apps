@@ -1,13 +1,87 @@
 # Only apps listed below with enabled: true are started.
 # Run-ListedApps.ps1 never scans the GitHub folder for projects.
 # api / webui paths are relative to root unless they are absolute.
+# listen: false = start the process but do not wait for an HTTP port (agents).
 
 root: C:/Users/armin/GitHub
 
-apps: []
-
-# Example — copy into apps, then set enabled: true:
-# - name: helix
-#   enabled: false
-#   api: helix-api
-#   webui: helix-webui
+apps:
+  - name: aipedia
+    enabled: true
+    api: aipedia-api
+    webui: aipedia-webui
+  - name: arvaz
+    enabled: true
+    api: arvaz-api
+    webui: arvaz-webui
+  - name: asip
+    enabled: true
+    api: asip-api
+    webui: asip-webui
+  - name: cs-quiz
+    enabled: true
+    api: cs-quiz-api
+    webui: cs-quiz-webui
+  - name: cursor-ai
+    enabled: true
+    api: cursor-ai-api
+    webui: cursor-ai-webui
+  - name: exar
+    enabled: true
+    api: exar-api
+    webui: exar-webui
+  - name: geoquiz
+    enabled: true
+    api: geoquiz-api
+    webui: geoquiz-webui
+  - name: helix
+    enabled: true
+    api: helix-api
+    webui: helix-webui
+  - name: janus
+    enabled: true
+    api: janus-api
+    webui: janus-webui
+  - name: knowledge-center
+    enabled: true
+    api: knowledge-center-api
+    webui: knowledge-center-webui
+  - name: lexmora
+    enabled: true
+    api: lexmora-api
+    webui: lexmora-webui
+  - name: mark
+    enabled: true
+    api: mark-api
+    webui: mark-ui
+  - name: netvan
+    enabled: true
+    api: netvan-api
+    webui: netvan-webui
+  - name: nevarix
+    enabled: true
+    api: nevarix-api
+    webui: nevarix-webui
+  - name: nevarix-agent
+    enabled: true
+    api: nevarix-agent
+    listen: false
+  - name: radar
+    enabled: true
+    api: radar-api
+    webui: radar-webui
+  - name: radar-agent
+    enabled: true
+    api: radar-agent
+    listen: false
+  - name: roust
+    enabled: true
+    api: roust-api
+    webui: roust-webui
+  - name: susiana
+    enabled: true
+    api: susiana-api
+  - name: traffic-monitoring
+    enabled: true
+    api: traffic-monitoring-api
+    webui: traffic-monitoring-webui
